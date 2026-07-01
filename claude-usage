@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+claude-usage — aggregiert Claude-Code-Nutzung (via ccusage) über MEHRERE Rechner.
+
+Wie es funktioniert:
+  - ccusage liest die lokalen Session-Transkripte in ~/.claude/ — pro Rechner,
+    accountunabhängig. Dieses Script ruft ccusage auf jedem Rechner auf und
+    addiert die Ergebnisse (Sessions sind rechnerlokal → keine Doppelzählung).
+
+Nichts ist hardcoded. Die Remote-Rechner stehen in der Config:
+      ~/.config/claude-usage/hosts
+  Eine Zeile pro Remote-Rechner im Format   label=ssh_ziel   z.B.:
+      mini=vincentborko@100.122.12.45
+      laptop2=me@100.x.y.z
+  Zeilen mit # sind Kommentare. Der lokale Rechner wird IMMER mitgezählt.
+
+  → Jeffrey (oder wer auch immer) nutzt dasselbe Script und trägt einfach
+    seine eigenen zwei PCs in seine eigene hosts-Datei ein. Voraussetzung:
+    schlüsselbasiertes SSH zu den Remote-Rechnern (z.B. Tailscale-SSH) und
+    node/npx dort verfügbar.
+
+Nutzung:
+  claude-usage                # letzte 7 Tage, täglich
+  claude-usage --days 30      # letzte 30 Tage
+  claude-usage --since 20260601
+  claude-usage --monthly      # monatlich statt täglich
+"""
+import argparse, json, subprocess, sys, socket, datetime as dt, os
+
+CONFIG = os.path.expanduser("~/.config/claude-usage/hosts")
+
+def read_hosts():
+    hosts = []
+    if os.path.exists(CONFIG):
+        for line in open(CONFIG):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            label, target = line.split("=", 1)
+            hosts.append((label.strip(), target.strip()))
+    return hosts
+
+def run_ccusage(mode, since, target):
+    """target=None → lokal; sonst via SSH. Gibt daily/monthly-Liste zurück."""
+    cc = f"npx -y ccusage@latest {mode} --json --since {since}"
+    if target is None:
+        cmd = ["bash", "-lc", cc]
+    else:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               target, f"bash -lc '{cc}'"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    if out.returncode != 0:
+        return None, (out.stderr.strip().splitlines() or ["ssh/ccusage fehlgeschlagen"])[-1]
+    try:
+        data = json.loads(out.stdout)
+    except Exception:
+        return None, "keine JSON-Antwort (npx/node vorhanden?)"
+    return data.get("daily") or data.get("monthly") or [], None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--since")
+    ap.add_argument("--monthly", action="store_true")
+    args = ap.parse_args()
+
+    mode = "monthly" if args.monthly else "daily"
+    if args.since:
+        since = args.since.replace("-", "")
+    else:
+        since = (dt.date.today() - dt.timedelta(days=args.days)).strftime("%Y%m%d")
+
+    local_label = socket.gethostname().split(".")[0][:12] + "*"
+    sources = [(local_label, None)] + read_hosts()
+
+    # label -> {period -> row}
+    per_source = {}
+    for label, target in sources:
+        rows, err = run_ccusage(mode, since, target)
+        if err:
+            print(f"⚠️  {label}: {err}", file=sys.stderr)
+            per_source[label] = {}
+            continue
+        per_source[label] = {r["period"]: r for r in rows}
+
+    labels = [l for l, _ in sources]
+    periods = sorted({p for d in per_source.values() for p in d})
+    if not periods:
+        print("Keine Nutzungsdaten gefunden.")
+        return
+
+    def cost(l, p): return per_source[l].get(p, {}).get("totalCost", 0) or 0
+    def toks(l, p): return per_source[l].get(p, {}).get("totalTokens", 0) or 0
+
+    wd = {l: max(9, len(l) + 3) for l in labels}  # Spaltenbreite pro Rechner
+    header = f"{'Zeitraum':<11}" + "".join(f"{l+' $':>{wd[l]}}" for l in labels) + \
+             f"{'Summe $':>11}{'Tokens Mio':>13}"
+    print(header); print("-" * len(header))
+    tot_l = {l: 0.0 for l in labels}; tot_sum = 0.0; tot_tok = 0
+    for p in periods:
+        row = f"{p:<11}"
+        s = 0.0
+        for l in labels:
+            c = cost(l, p); s += c; tot_l[l] += c
+            row += f"{c:>{wd[l]}.0f}"
+        tk = sum(toks(l, p) for l in labels); tot_tok += tk; tot_sum += s
+        row += f"{s:>11.0f}{tk/1e6:>13.1f}"
+        print(row)
+    print("-" * len(header))
+    foot = f"{'TOTAL':<11}" + "".join(f"{tot_l[l]:>{wd[l]}.0f}" for l in labels) + \
+           f"{tot_sum:>11.0f}{tot_tok/1e6:>13.0f}"
+    print(foot)
+    print(f"\n(* = lokaler Rechner)  Äquiv. API-Kosten gesamt: ${tot_sum:,.0f}  ·  Tokens: {tot_tok/1e9:.2f} Mrd")
+    print("(äquivalente API-Preise als Volumenmaß — nicht der reale Abo-Betrag)")
+
+if __name__ == "__main__":
+    main()

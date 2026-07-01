@@ -1,0 +1,8 @@
+# claude-usage: Remote-Rechner, die mitgezählt werden sollen.
+# Kopiere diese Datei nach  ~/.config/claude-usage/hosts  und trage DEINE Rechner ein.
+# Format:  label=ssh_ziel     (ein Rechner pro Zeile, # = Kommentar)
+# Der lokale Rechner wird IMMER automatisch mitgezählt — hier nur die ANDEREN eintragen.
+#
+# Beispiel (dein zweiter PC, erreichbar per key-based SSH / Tailscale-SSH):
+# laptop=deinuser@100.x.y.z
+# desktop=deinuser@100.a.b.c
