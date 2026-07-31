@@ -24,10 +24,22 @@ Nutzung:
   claude-usage --days 30      # letzte 30 Tage
   claude-usage --since 20260601
   claude-usage --monthly      # monatlich statt täglich
+
+Langzeit-Archiv:
+  claude-usage --snapshot     # Tageswerte in ~/.config/claude-usage/history.csv sichern
+  claude-usage --history      # aus dem Archiv lesen (reicht beliebig weit zurück)
+
+  Claude Code löscht die Session-Transkripte nach `cleanupPeriodDays` (Standard 30).
+  Ohne Archiv ist alles Ältere unwiederbringlich weg. --snapshot schreibt nur die
+  Aggregatzeilen (Datum, Rechner, Kosten, Tokens) — ein Jahr davon sind ~40 KB.
+  Regelmässig laufen lassen (wöchentlich reicht, solange --days das Löschfenster
+  mehrfach überlappt); die Tagesgranularität hängt nicht an der Laufhäufigkeit.
 """
-import argparse, json, subprocess, sys, socket, datetime as dt, os
+import argparse, json, subprocess, sys, socket, datetime as dt, os, csv, tempfile
 
 CONFIG = os.path.expanduser("~/.config/claude-usage/hosts")
+HISTORY = os.path.expanduser("~/.config/claude-usage/history.csv")
+HISTORY_COLS = ["date", "host", "cost_usd", "tokens"]
 
 def read_hosts():
     hosts = []
@@ -60,12 +72,92 @@ def run_ccusage(mode, since, target):
         return None, "keine JSON-Antwort (npx/node vorhanden?)"
     return data.get("daily") or data.get("monthly") or [], None
 
+def read_history():
+    """history.csv -> {(date, host): (cost, tokens)}. Fehlt die Datei: leer."""
+    out = {}
+    if not os.path.exists(HISTORY):
+        return out
+    with open(HISTORY, newline="") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                out[(r["date"], r["host"])] = (float(r["cost_usd"]), int(r["tokens"]))
+            except (KeyError, ValueError, TypeError):
+                continue  # kaputte Zeile überspringen, nie den Rest verwerfen
+    return out
+
+def write_history(rows):
+    """Atomar schreiben — ein abgebrochener Lauf darf das Archiv nicht köpfen."""
+    d = os.path.dirname(HISTORY)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".history-", suffix=".csv")
+    try:
+        with os.fdopen(fd, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(HISTORY_COLS)
+            for (date, host), (cost, toks) in sorted(rows.items()):
+                w.writerow([date, host, f"{cost:.4f}", toks])
+        os.replace(tmp, HISTORY)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+def snapshot(per_source, failed, since):
+    """Frisch gemessene Tageswerte ins Archiv mergen (upsert je (Tag, Rechner))."""
+    hist = read_history()
+    before = len(hist)
+
+    for label, rows in per_source.items():
+        host = label.rstrip("*")
+        if label in failed:
+            print(f"⚠️  {host}: nicht erreichbar — vorhandene Archivzeilen bleiben unberührt",
+                  file=sys.stderr)
+            continue
+        old_in_window = {k for k in hist if k[1] == host and k[0].replace("-", "") >= since}
+        # Leere Messung bei vorhandenem Bestand ist verdächtig (Messwerkzeug still
+        # kaputt sieht genauso aus wie "nichts gearbeitet") → nicht löschen, melden.
+        if not rows and old_in_window:
+            print(f"⚠️  {host}: 0 Zeilen gemessen, aber {len(old_in_window)} im Archiv — "
+                  f"nichts überschrieben (Messfehler? ccusage prüfen)", file=sys.stderr)
+            continue
+        for k in old_in_window:
+            del hist[k]
+        for period, r in rows.items():
+            hist[(period, host)] = (r.get("totalCost", 0) or 0, r.get("totalTokens", 0) or 0)
+
+    write_history(hist)
+    days = len({d for d, _ in hist})
+    span = (min(d for d, _ in hist), max(d for d, _ in hist)) if hist else ("—", "—")
+    print(f"Archiv: {len(hist)} Zeilen ({len(hist) - before:+d}) · {days} Tage · "
+          f"{span[0]} bis {span[1]}\n{HISTORY}")
+
+def history_source(since, monthly):
+    """Archiv im per_source-Format nachbauen, damit die Tabelle unverändert läuft."""
+    hist = read_history()
+    per = {}
+    for (date, host), (cost, toks) in hist.items():
+        if date.replace("-", "") < since:
+            continue
+        period = date[:7] if monthly else date
+        cur = per.setdefault(host, {}).setdefault(period, {"period": period,
+                                                          "totalCost": 0.0, "totalTokens": 0})
+        cur["totalCost"] += cost
+        cur["totalTokens"] += toks
+    return per
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--since")
     ap.add_argument("--monthly", action="store_true")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="Tageswerte ins Langzeit-Archiv sichern (Default-Fenster 20 Tage)")
+    ap.add_argument("--history", action="store_true",
+                    help="aus dem Archiv lesen statt aus den Transkripten")
     args = ap.parse_args()
+
+    if args.snapshot and not args.since and args.days == 7:
+        args.days = 20  # muss das 30-Tage-Löschfenster mehrfach überlappen
 
     mode = "monthly" if args.monthly else "daily"
     if args.since:
@@ -73,20 +165,32 @@ def main():
     else:
         since = (dt.date.today() - dt.timedelta(days=args.days)).strftime("%Y%m%d")
 
-    local_label = socket.gethostname().split(".")[0][:12] + "*"
-    sources = [(local_label, None)] + read_hosts()
+    if args.history:
+        per_source = history_source(since, args.monthly)
+        labels = sorted(per_source)
+        if not labels:
+            print(f"Kein Archiv unter {HISTORY} — erst `claude-usage --snapshot` laufen lassen.")
+            return
+    else:
+        local_label = socket.gethostname().split(".")[0][:12] + "*"
+        sources = [(local_label, None)] + read_hosts()
 
-    # label -> {period -> row}
-    per_source = {}
-    for label, target in sources:
-        rows, err = run_ccusage(mode, since, target)
-        if err:
-            print(f"⚠️  {label}: {err}", file=sys.stderr)
-            per_source[label] = {}
-            continue
-        per_source[label] = {r["period"]: r for r in rows}
+        # label -> {period -> row}
+        per_source, failed = {}, set()
+        for label, target in sources:
+            rows, err = run_ccusage(mode, since, target)
+            if err:
+                print(f"⚠️  {label}: {err}", file=sys.stderr)
+                per_source[label] = {}
+                failed.add(label)
+                continue
+            per_source[label] = {r["period"]: r for r in rows}
 
-    labels = [l for l, _ in sources]
+        if args.snapshot:
+            snapshot(per_source, failed, since)
+            return
+
+        labels = [l for l, _ in sources]
     periods = sorted({p for d in per_source.values() for p in d})
     if not periods:
         print("Keine Nutzungsdaten gefunden.")
@@ -113,7 +217,8 @@ def main():
     foot = f"{'TOTAL':<11}" + "".join(f"{tot_l[l]:>{wd[l]}.0f}" for l in labels) + \
            f"{tot_sum:>11.0f}{tot_tok/1e6:>13.0f}"
     print(foot)
-    print(f"\n(* = lokaler Rechner)  Äquiv. API-Kosten gesamt: ${tot_sum:,.0f}  ·  Tokens: {tot_tok/1e9:.2f} Mrd")
+    quelle = f"(Quelle: Archiv {HISTORY})" if args.history else "(* = lokaler Rechner)"
+    print(f"\n{quelle}  Äquiv. API-Kosten gesamt: ${tot_sum:,.0f}  ·  Tokens: {tot_tok/1e9:.2f} Mrd")
     print("(äquivalente API-Preise als Volumenmaß — nicht der reale Abo-Betrag)")
 
 if __name__ == "__main__":
