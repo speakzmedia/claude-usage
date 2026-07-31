@@ -28,14 +28,21 @@ Nutzung:
 Langzeit-Archiv:
   claude-usage --snapshot     # Tageswerte in ~/.config/claude-usage/history.csv sichern
   claude-usage --history      # aus dem Archiv lesen (reicht beliebig weit zurück)
+  claude-usage --local-only   # dabei die Remote-Archive NICHT dazuholen
 
   Claude Code löscht die Session-Transkripte nach `cleanupPeriodDays` (Standard 30).
   Ohne Archiv ist alles Ältere unwiederbringlich weg. --snapshot schreibt nur die
   Aggregatzeilen (Datum, Rechner, Kosten, Tokens) — ein Jahr davon sind ~40 KB.
   Regelmässig laufen lassen (wöchentlich reicht, solange --days das Löschfenster
   mehrfach überlappt); die Tagesgranularität hängt nicht an der Laufhäufigkeit.
+
+  Am besten schnappschusst JEDE Maschine, dann archiviert jede mindestens sich
+  selbst — auch wenn die andere gerade aus ist. --history führt die Archive beim
+  Lesen wieder zusammen. Dafür muss jede Maschine überall gleich heissen: wessen
+  Hostname nicht zum hosts-Label der Gegenseite passt, setzt `self=<label>` in
+  seiner eigenen hosts-Datei. Ohne das zählt der Merge dieselbe Maschine doppelt.
 """
-import argparse, json, subprocess, sys, socket, datetime as dt, os, csv, tempfile
+import argparse, json, subprocess, sys, socket, datetime as dt, os, csv, tempfile, io
 
 CONFIG = os.path.expanduser("~/.config/claude-usage/hosts")
 HISTORY = os.path.expanduser("~/.config/claude-usage/history.csv")
@@ -49,8 +56,35 @@ def read_hosts():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             label, target = line.split("=", 1)
+            if label.strip() == "self":
+                continue  # kein Remote-Rechner, sondern der eigene Name (s. local_label)
             hosts.append((label.strip(), target.strip()))
     return hosts
+
+def local_label():
+    """Wie dieser Rechner im Archiv heisst.
+
+    Der Hostname taugt dafür nur solange nur EINE Maschine archiviert: sobald
+    zwei es tun, muss jede dieselbe Maschine gleich benennen, sonst zählt der
+    Merge sie doppelt. Ein Mac mini mit Hostname "Mac.local" nennt sich sonst
+    "Mac", während die andere Maschine ihn per hosts-Label "mini" kennt.
+    Deshalb: `self=<label>` in der hosts-Datei gewinnt, exakt so geschrieben
+    wie das Label, unter dem die anderen Rechner ihn führen.
+    """
+    if os.path.exists(CONFIG):
+        for line in open(CONFIG):
+            line = line.strip()
+            if line.startswith("self=") :
+                v = line.split("=", 1)[1].strip()
+                if v:
+                    return v
+    return socket.gethostname().split(".")[0][:12]
+
+# Eine nicht-interaktive SSH-Shell erbt weder nvm noch Homebrew — der PATH aus
+# ~/.zshrc gilt dort nicht. Ohne das findet ein Remote-Lauf schlicht kein npx
+# ("command not found"), und zwar genau dann, wenn niemand zuschaut.
+PATH_FIX = ('export PATH="$PATH:$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | tail -1)'
+            ':/opt/homebrew/bin:/usr/local/bin"; ')
 
 def run_ccusage(mode, since, target):
     """target=None → lokal; sonst via SSH. Gibt daily/monthly-Liste zurück."""
@@ -59,7 +93,7 @@ def run_ccusage(mode, since, target):
         cmd = ["bash", "-lc", cc]
     else:
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-               target, f"bash -lc '{cc}'"]
+               target, f"bash -lc '{PATH_FIX}{cc}'"]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
@@ -131,9 +165,57 @@ def snapshot(per_source, failed, since):
     print(f"Archiv: {len(hist)} Zeilen ({len(hist) - before:+d}) · {days} Tage · "
           f"{span[0]} bis {span[1]}\n{HISTORY}")
 
-def history_source(since, monthly):
+def merge_remote_histories(hist):
+    """Archive der Remote-Rechner dazuholen.
+
+    Jede Maschine schnappschusst sich selbst zuverlaessig, die andere nur wenn
+    erreichbar — beim Lesen fuehrt das die Teilbilder wieder zusammen. Bei
+    Kollision gewinnt der groessere Wert: derselbe Tag ist auf einer Maschine
+    nur dann kleiner, wenn sie ihn angebrochen erwischt hat.
+    """
+    known = {local_label()} | {l for l, _ in read_hosts()}
+    for label, target in read_hosts():
+        try:
+            out = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+                 "cat ~/.config/claude-usage/history.csv"],
+                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            print(f"⚠️  {label}: Archiv nicht erreichbar (timeout)", file=sys.stderr)
+            continue
+        if out.returncode != 0:
+            print(f"⚠️  {label}: kein Archiv dort ({(out.stderr.strip().splitlines() or ['?'])[-1]})",
+                  file=sys.stderr)
+            continue
+        added = 0
+        unbekannt = set()
+        for r in csv.DictReader(io.StringIO(out.stdout)):
+            try:
+                k = (r["date"], r["host"])
+                v = (float(r["cost_usd"]), int(r["tokens"]))
+            except (KeyError, ValueError, TypeError):
+                continue
+            unbekannt.add(r["host"])
+            if k not in hist or v[0] > hist[k][0]:
+                hist[k] = v
+                added += 1
+        if added:
+            print(f"   {label}: {added} Zeilen aus dessen Archiv ergänzt", file=sys.stderr)
+        # Ein Rechner, den nur die Gegenseite kennt, ist entweder wirklich neu
+        # oder DIESELBE Maschine unter anderem Namen — dann wird doppelt gezählt.
+        for fremd in sorted(unbekannt - known):
+            print(f"⚠️  {label} führt einen Rechner »{fremd}«, den dieser hier nicht kennt. "
+                  f"Ist das eine zusätzliche Maschine, passt alles. Ist es dieselbe unter "
+                  f"anderem Namen, zählt die Summe sie doppelt — dann auf jener Maschine "
+                  f"`self=<gemeinsames Label>` in ~/.config/claude-usage/hosts setzen und "
+                  f"die alten Zeilen im dortigen Archiv umbenennen.", file=sys.stderr)
+    return hist
+
+def history_source(since, monthly, merge_remote=True):
     """Archiv im per_source-Format nachbauen, damit die Tabelle unverändert läuft."""
     hist = read_history()
+    if merge_remote:
+        hist = merge_remote_histories(hist)
     per = {}
     for (date, host), (cost, toks) in hist.items():
         if date.replace("-", "") < since:
@@ -154,6 +236,8 @@ def main():
                     help="Tageswerte ins Langzeit-Archiv sichern (Default-Fenster 20 Tage)")
     ap.add_argument("--history", action="store_true",
                     help="aus dem Archiv lesen statt aus den Transkripten")
+    ap.add_argument("--local-only", action="store_true",
+                    help="nur das Archiv dieses Rechners lesen (kein SSH)")
     args = ap.parse_args()
 
     if args.snapshot and not args.since and args.days == 7:
@@ -166,14 +250,13 @@ def main():
         since = (dt.date.today() - dt.timedelta(days=args.days)).strftime("%Y%m%d")
 
     if args.history:
-        per_source = history_source(since, args.monthly)
+        per_source = history_source(since, args.monthly, merge_remote=not args.local_only)
         labels = sorted(per_source)
         if not labels:
             print(f"Kein Archiv unter {HISTORY} — erst `claude-usage --snapshot` laufen lassen.")
             return
     else:
-        local_label = socket.gethostname().split(".")[0][:12] + "*"
-        sources = [(local_label, None)] + read_hosts()
+        sources = [(local_label() + "*", None)] + read_hosts()
 
         # label -> {period -> row}
         per_source, failed = {}, set()
