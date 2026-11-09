@@ -88,7 +88,8 @@ claude-usage --history --since 20260101 --monthly   # aus dem Archiv lesen
 ```
 
 Das Archiv liegt in `~/.config/claude-usage/history.csv` und enthält **nur die Aggregate** —
-eine Zeile pro Tag und Rechner (`date,host,cost_usd,tokens`). Ein Jahr sind rund 45 KB.
+eine Zeile pro Tag und Rechner (`date,host,cost_usd,tokens`). Auch mit `--monthly`
+sichert `--snapshot` Tageswerte; Monatsberichte entstehen mit `--history --monthly`. Ein Jahr sind rund 45 KB.
 Die Transkripte selbst werden nicht angefasst; das Fenster hochzudrehen wäre die teure Variante
 (Grössenordnung mehrere Dutzend GB pro Jahr).
 

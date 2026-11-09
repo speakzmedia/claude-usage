@@ -243,7 +243,8 @@ def main():
     if args.snapshot and not args.since and args.days == 7:
         args.days = 20  # muss das 30-Tage-Löschfenster mehrfach überlappen
 
-    mode = "monthly" if args.monthly else "daily"
+    # Das Archiv hat Tagesgranularität; --monthly steuert nur Berichte.
+    mode = "monthly" if args.monthly and not args.snapshot else "daily"
     if args.since:
         since = args.since.replace("-", "")
     else:
