@@ -6,7 +6,10 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Eigene Runner statt GitHub: der Job liest kein Secret, und jede gehostete Minute zählt gegen das
+    # Org-Kontingent (release-tooling playbooks/ci-runner.md, Abschnitt 1). `Linux`, weil `ci-leicht`
+    # auch Macs tragen.
+    runs-on: [ci-leicht, Linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
